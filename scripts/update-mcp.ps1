@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Weekly, check-before-update maintenance for every MCP server in
-  C:\Users\serge\.pi\agent\mcp.json.
+  ~/.pi/agent/mcp.json.
 
 .DESCRIPTION
   For each server listed in scripts\update-manifest.json:
@@ -24,7 +24,7 @@
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Restart     # kill procs of servers it updated
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -RepairData  # rebuild OpenNutrition 330MB food DB
 .LINK
-  mcp-reload.ps1 (D:\Sergey\Development) to restart / enable / disable servers in a live session.
+  a companion reload script (optional) to restart / enable / disable servers in a live session.
 #>
 param(
   [string[]]$Name = @(),
@@ -38,13 +38,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Root     = 'C:\Users\serge\.pi\agent\mcp-servers'
-$ConfigF  = 'C:\Users\serge\.pi\agent\mcp.json'
+$Root     = Join-Path $HOME '.pi\agent\mcp-servers'
+$ConfigF  = Join-Path $HOME '.pi\agent\mcp.json'
 $Manifest = Join-Path $Root 'scripts\update-manifest.json'
 $Log      = Join-Path $Root 'state\update.log'
 $Stamps   = Join-Path $Root 'state\stamps'
 $env:UV_TOOL_DIR = Join-Path $Root 'tools\uv'   # PyPI MCP servers live here
-$env:Path = "C:\Users\serge\.local/bin;C:\Program Files\nodejs;$env:Path"
+$env:Path = "$env:USERPROFILE\.local/bin;C:\Program Files\nodejs;$env:Path"
 
 if (-not (Test-Path $Stamps)) { New-Item -ItemType Directory -Path $Stamps -Force | Out-Null }
 

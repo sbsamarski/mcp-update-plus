@@ -2,7 +2,7 @@
  * mcp-updater.ts — MCP server maintenance from inside pi.
  *
  * 1. On every session_start it launches
- *      C:\Users\serge\.pi\agent\extensions\mcp-update-plus\scripts\update-mcp.ps1
+ *      ~/.pi/agent\extensions\mcp-update-plus\scripts\update-mcp.ps1
  *    detached (fire and forget, never blocks pi). The script itself decides
  *    whether to do anything: each server has its own 7-day stamp in
  *    mcp-servers\state\stamps\, so a normal launch checks the stamps, updates
@@ -26,15 +26,20 @@
  * list and enabled flags, then updates the installs.
  *
  * Turn the startup sweep off without uninstalling: create an empty file
- *   C:\Users\serge\.pi\agent\mcp-servers\state\updates-disabled
+ *   ~/.pi/agent\mcp-servers\state\updates-disabled
  * Force a run by hand:
- *   powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\serge\.pi\agent\extensions\mcp-update-plus\scripts\update-mcp.ps1 -Force
+ *   powershell -NoProfile -ExecutionPolicy Bypass -File ~/.pi/agent\extensions\mcp-update-plus\scripts\update-mcp.ps1 -Force
  */
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-const SWEEP = "C:\\Users\\serge\\.pi\\agent\\extensions\\mcp-update-plus\\scripts\\update-mcp.ps1";
-const OFF_SWITCH = "C:\\Users\\serge\\.pi\\agent\\mcp-servers\\state\\updates-disabled";
+import { homedir } from "node:os";
+import path from "node:path";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SWEEP = path.join(HERE, "..", "scripts", "update-mcp.ps1");
+const OFF_SWITCH = path.join(homedir(), ".pi", "agent", "mcp-servers", "state", "updates-disabled");
 const POWERHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 
 /** Run the sweep in the foreground and resolve with a one-line summary. */
