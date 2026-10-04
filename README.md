@@ -56,3 +56,7 @@ scripts/update-mcp.ps1      the updater itself (kinds, guards, stamps, logging)
 Sweep state lives in `~/.pi/agent/mcp-servers/state/` (`update.log`, `stamps\<name>.stamp`).
 Turn the startup sweep off without uninstalling: create an empty file
 `mcp-servers\state\updates-disabled`.
+
+> **Note on `tsconfig.json`:** it exists only for optional type-checking on the maintainer's machine
+> (its `paths` entries point at the maintainer's global pi install). It is never used at runtime and
+> does not affect loading, running, or installing this extension on another computer.
