@@ -3,11 +3,27 @@
  *
  * 1. On every session_start it launches
  *      ~/.pi/agent\extensions\mcp-update-plus\scripts\update-mcp.ps1
- *    detached (fire and forget, never blocks pi). The script itself decides
- *    whether to do anything: each server has its own 7-day stamp in
+ *    in the background (fire and forget, never blocks pi). The script itself
+ *    decides whether to do anything: each server has its own 7-day stamp in
  *    mcp-servers\state\stamps\, so a normal launch checks the stamps, updates
  *    only servers that are both older than 7 days AND have a newer upstream
  *    version, and exits in ~2 seconds when there is nothing to do.
+ *    `-All` is passed so servers that are installed but currently switched off
+ *    in mcp.json (enabled: false) still stay current - "every server" means
+ *    every server, not only the ones pi happens to connect right now.
+ *    `-SettleSeconds 90` is passed so the WAIT happens in the background
+ *    process, not inside pi: pi hands the job over at once, the sweep then
+ *    waits 90 s for this session's servers to settle (a server mid-connect
+ *    would lock its own files) and only then starts checking.
+ *
+ *    IMPORTANT (fixed 2026-11-01): the child must NOT be spawned with
+ *    `detached: true`. libuv turns that into the Windows DETACHED_PROCESS flag,
+ *    and Windows PowerShell 5.1 exits straight away when it has no console -
+ *    silently, with exit code 0, having run none of the script. That is why the
+ *    weekly sweep looked like it started but never did anything. The child is
+ *    now started through a short-lived helper PowerShell that hands the work to
+ *    an independent grandchild with Start-Process, so it is still fully
+ *    fire-and-forget and survives pi closing.
  *
  * 2. /mcp-update-plus — forced update check from inside pi, whenever you want:
  *      /mcp-update-plus              force check + update ALL servers (ignores the 7-day stamps)
@@ -28,11 +44,13 @@
  * Turn the startup sweep off without uninstalling: create an empty file
  *   ~/.pi/agent\mcp-servers\state\updates-disabled
  * Force a run by hand:
- *   powershell -NoProfile -ExecutionPolicy Bypass -File ~/.pi/agent\extensions\mcp-update-plus\scripts\update-mcp.ps1 -Force
+ *   powershell -NoProfile -ExecutionPolicy Bypass -File ~/.pi/agent\extensions\mcp-update-plus\scripts\update-mcp.ps1 -Force -All
+ * See what the background sweeps have been doing:
+ *   type ~/.pi\agent\mcp-servers\state\update.log
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { dirname } from "node:path";
@@ -40,7 +58,31 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SWEEP = path.join(HERE, "..", "scripts", "update-mcp.ps1");
 const OFF_SWITCH = path.join(homedir(), ".pi", "agent", "mcp-servers", "state", "updates-disabled");
+const LOG = path.join(homedir(), ".pi", "agent", "mcp-servers", "state", "update.log");
 const POWERHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+/** Seconds the background sweep waits before it starts touching servers. */
+const SETTLE_SECONDS = 90;
+
+/** 'yyyy-MM-dd HH:mm:ss' in local time - same shape as update-mcp.ps1 writes. */
+function stamp(): string {
+	const d = new Date();
+	const p = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Append a line to the sweep log so a launch is always visible/auditable. */
+function logLine(msg: string): void {
+	try {
+		appendFileSync(LOG, `[${stamp()}] ${"launch".padEnd(14)} ${msg}\n`, "utf8");
+	} catch {
+		/* logging must never break a session */
+	}
+}
+
+/** Quote one argument as a PowerShell single-quoted string literal. */
+function psQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
 
 /** Run the sweep in the foreground and resolve with a one-line summary. */
 function runSweep(args: string[], timeoutMs = 30 * 60 * 1000): Promise<string> {
@@ -83,6 +125,38 @@ function runSweep(args: string[], timeoutMs = 30 * 60 * 1000): Promise<string> {
 	});
 }
 
+/**
+ * Start the sweep as a background job that outlives pi, without blocking it.
+ *
+ * Do not "simplify" this back to spawn(..., { detached: true }): on Windows
+ * that means DETACHED_PROCESS, and powershell.exe then quits immediately
+ * without executing anything (exit code 0, no output, nothing logged).
+ * Instead a helper PowerShell (which does get a console, just no window)
+ * starts the real sweep with Start-Process. The helper exits in ~0.3 s and the
+ * sweep keeps running on its own, hidden, even if pi closes right after.
+ */
+function launchBackgroundSweep(args: string[]): boolean {
+	try {
+		const argList = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SWEEP, ...args]
+			.map(psQuote)
+			.join(", ");
+		const helper = `Start-Process -WindowStyle Hidden -FilePath ${psQuote(POWERHELL)} -ArgumentList ${argList}`;
+		const child = spawn(
+			POWERHELL,
+			["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", helper],
+			{ detached: false, stdio: "ignore", windowsHide: true },
+		);
+		child.on("error", (error: unknown) => {
+			logLine(`background sweep helper failed to start: ${(error as Error).message}`);
+		});
+		child.unref();
+		return true;
+	} catch (error: unknown) {
+		logLine(`background sweep helper could not be launched: ${(error as Error).message}`);
+		return false;
+	}
+}
+
 export default function (pi: any) {
 	pi.registerCommand("mcp-update-plus", {
 		description: "MCP server updates: forced update now (no args), check-only (check), or named servers",
@@ -95,13 +169,13 @@ export default function (pi: any) {
 			if (words.length === 0) {
 				// Forced full check + update (ignores the 7-day stamps).
 				ctx.ui.notify("MCP update: checking all servers for newer versions (forced)...", "info");
-				const result = await runSweep(["-Force", "-Restart"]);
+				const result = await runSweep(["-Force", "-Restart", "-All"]);
 				ctx.ui.notify(`MCP update ${result}`, "info");
 				return;
 			}
 			if (words[0] === "check") {
 				ctx.ui.notify("MCP update: check-only (installed vs latest, nothing is changed)...", "info");
-				const result = await runSweep(["-CheckOnly"]);
+				const result = await runSweep(["-CheckOnly", "-All"]);
 				ctx.ui.notify(`MCP check ${result}`, "info");
 				return;
 			}
@@ -115,27 +189,32 @@ export default function (pi: any) {
 
 	pi.on("session_start", async (_event: any, ctx: any) => {
 		try {
-			if (!existsSync(SWEEP)) return;
-			if (existsSync(OFF_SWITCH)) return;
+			if (!existsSync(SWEEP)) {
+				logLine(`startup sweep skipped: script not found at ${SWEEP}`);
+				return;
+			}
+			if (existsSync(OFF_SWITCH)) return; // user turned the startup sweep off
 
-			// delay 90 s so the session's servers have settled before the sweep
-			// checks them (a server mid-connect would lock its own files)
-			const timer = setTimeout(() => {
-				const child = spawn(
-					POWERHELL,
-					["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SWEEP, "-Restart"],
-					{ detached: true, stdio: "ignore", windowsHide: true },
+			// Hand the job over immediately. The sweep waits SETTLE_SECONDS itself,
+			// so a short-lived pi session still gets its weekly check done, and the
+			// per-server 7-day stamps keep the work to at most once a week per server.
+			const started = launchBackgroundSweep([
+				"-Restart",
+				"-All",
+				"-SettleSeconds",
+				String(SETTLE_SECONDS),
+			]);
+			if (started) {
+				logLine(
+					`startup sweep handed to background (settles ${SETTLE_SECONDS}s, then checks once per 7 days per server)`,
 				);
-				child.on("error", () => {
-					/* never let a failed sweep disturb the session */
-				});
-				child.unref();
-			}, 90 * 1000) as unknown as { unref(): void };
-			timer.unref();
-
-			ctx.ui?.notify?.("MCP update check started in background (log: .pi\\agent\\mcp-servers\\state\\update.log)", "info");
+			}
+			ctx.ui?.notify?.(
+				"MCP update check started in background (log: .pi\\agent\\mcp-servers\\state\\update.log)",
+				"info",
+			);
 		} catch {
-			/* ignore */
+			/* never let a failed sweep disturb the session */
 		}
 	});
 }

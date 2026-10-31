@@ -16,12 +16,13 @@
   never blocks a session.
 
 .USAGE
-  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1              # weekly sweep (quiet if nothing to do)
-  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Status      # installed vs latest table, changes nothing
-  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -CheckOnly   # same as -Status but includes disabled
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1              # weekly sweep of the enabled servers (logs start + finish)
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -All         # every server in the manifest, also the ones disabled in mcp.json
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -CheckOnly   # installed vs latest table, changes nothing (-Status is the same)
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Force       # ignore the 7-day stamps
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Name arxiv,github -Force
-  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Restart     # kill procs of servers it updated
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Restart     # stop the servers it updated, so the new code loads
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -SettleSeconds 90   # wait first (used by the pi startup hook)
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -RepairData  # rebuild OpenNutrition 330MB food DB
 .LINK
   a companion reload script (optional) to restart / enable / disable servers in a live session.
@@ -34,10 +35,14 @@ param(
   [switch]$Status,
   [switch]$Restart,
   [switch]$RepairData,
-  [int]$IntervalDays = 7
+  [int]$IntervalDays = 7,
+  [int]$SettleSeconds = 0
 )
 
 $ErrorActionPreference = 'Continue'
+# Read-only means "print the table, touch nothing". Both -Status and -CheckOnly
+# mean that; -Status used to fall through and actually install updates.
+$ReadOnly = [bool]($Status -or $CheckOnly)
 $Root     = Join-Path $HOME '.pi\agent\mcp-servers'
 $ConfigF  = Join-Path $HOME '.pi\agent\mcp.json'
 $Manifest = Join-Path $Root 'scripts\update-manifest.json'
@@ -215,7 +220,7 @@ function Update-One([string]$name, $m, $cfgEntry) {
       if (-not $res.installed) { $res.action = 'not installed here' }
       elseif (-not $res.latest) { $res.action = 'PyPI query failed' }
       elseif ($res.installed -ne $res.latest) { $res.action = "UPDATE $($res.installed) -> $($res.latest)" }
-      if (-not $CheckOnly -and $res.action -like 'UPDATE*' -and $res.latest) {
+      if (-not $ReadOnly -and $res.action -like 'UPDATE*' -and $res.latest) {
         $rp = @(Get-RunningServerPids $name $cfgEntry)
         if ($rp.Count -gt 0 -and -not $Restart) {
           Set-Content -Path (Join-Path $Stamps ("{0}.stamp" -f $name)) -Value (Get-Date).AddDays(-($IntervalDays + 1)).ToString('o')   # retry at next startup
@@ -252,7 +257,7 @@ function Update-One([string]$name, $m, $cfgEntry) {
       if (-not $res.installed) { $res.action = 'not installed here' }
       elseif (-not $res.latest) { $res.action = 'npm registry query failed' }
       elseif ($res.installed -ne $res.latest) { $res.action = "UPDATE $($res.installed) -> $($res.latest)" }
-      if (-not $CheckOnly -and $res.action -like 'UPDATE*') {
+      if (-not $ReadOnly -and $res.action -like 'UPDATE*') {
         Log $name $res.action
         $u = Run-Bounded { param($p) (& npm install -g ("{0}@latest" -f $p) 2>&1) -join "`n" } 900 $m.package
         Log $name ("npm upgrade ok={0} {1}" -f $u.ok, (Short $u.out 200))
@@ -267,7 +272,7 @@ function Update-One([string]$name, $m, $cfgEntry) {
       if (-not $res.installed) { $res.action = 'binary missing' }
       elseif (-not $r.tag) { $res.action = 'GitHub release query failed' }
       elseif ($res.installed -ne $r.tag) { $res.action = "UPDATE $($res.installed) -> $($r.tag)" }
-      if (-not $CheckOnly -and $res.action -like 'UPDATE*') {
+      if (-not $ReadOnly -and $res.action -like 'UPDATE*') {
         $rp = @(Get-RunningServerPids $name $cfgEntry)
         if ($rp.Count -gt 0 -and -not $Restart) {
           Set-Content -Path (Join-Path $Stamps ("{0}.stamp" -f $name)) -Value (Get-Date).AddDays(-($IntervalDays + 1)).ToString('o')   # retry at next startup
@@ -309,7 +314,7 @@ function Update-One([string]$name, $m, $cfgEntry) {
       $res.installed = $g.head
       $res.latest    = if ($g.behind -gt 0) { "+$($g.behind) commits" } else { 'same' }
       $res.action    = if ($g.behind -gt 0) { "UPDATE pull $($g.behind) commit(s)" } else { 'up to date' }
-      if (-not $CheckOnly -and $g.behind -gt 0) {
+      if (-not $ReadOnly -and $g.behind -gt 0) {
         Log $name $res.action
         $p = Run-Bounded { param($r) (& git -C $r pull --ff-only 2>&1) -join "`n" } 300 $m.path
         Log $name ("git pull ok={0} {1}" -f $p.ok, (Short $p.out 200))
@@ -324,7 +329,7 @@ function Update-One([string]$name, $m, $cfgEntry) {
     }
   }
   if ($m.dataset) {
-    $d = Update-Dataset $name $m.dataset ([bool]$CheckOnly)
+    $d = Update-Dataset $name $m.dataset ([bool]$ReadOnly)
     if ($d -like 'UPDATE FAILED*' -or $d -like 'check failed*') {
       Set-Content -Path (Join-Path $Stamps ("{0}.stamp" -f $name)) -Value (Get-Date).AddDays(-($IntervalDays + 1)).ToString('o')   # retry sooner
     }
@@ -377,6 +382,14 @@ function Get-ServerPids([string]$name, $cfg) {
 }
 
 # ============================ main =========================================
+# One sweep at a time: two pi sessions started together (or a manual run on top
+# of a background one) would otherwise reinstall the same tool box twice at once.
+$Mutex = New-Object System.Threading.Mutex($false, 'Local\pi-mcp-update-plus')
+if (-not $Mutex.WaitOne(0)) {
+  Log 'sweep' 'another sweep is already running - this one exits'
+  exit 0
+}
+
 if (-not (Test-Path $Manifest)) { Write-Host "missing manifest: $Manifest"; exit 1 }
 if (-not (Test-Path $ConfigF))  { Write-Host "missing config: $ConfigF"; exit 1 }
 $mf = Read-Jsonc $Manifest
@@ -389,6 +402,21 @@ if ($RepairData) {
   & cmd /c "cd /d `"$o`" && npm install --no-audit --no-fund && npx tsc && npx tsx scripts/run-windows.ts decompress && npx tsx scripts/run-windows.ts sqlite && rd /s /q data_local_temp"
   Log 'opennutrition' '-RepairData finished'
   exit $LASTEXITCODE
+}
+
+# Every run announces itself in state\update.log: "nothing happened" must never
+# be confused with "nobody ever got here".
+$invoked = @()
+if ($All) { $invoked += '-All' }
+if ($Force) { $invoked += '-Force' }
+if ($Restart) { $invoked += '-Restart' }
+if ($ReadOnly) { $invoked += if ($Status) { '-Status' } else { '-CheckOnly' } }
+if ($Name.Count -gt 0) { $invoked += ('-Name ' + ($Name -join ',')) }
+if ($SettleSeconds -gt 0) {
+  Log 'sweep' ("start (background) | {0} | waiting {1}s for the session's servers to settle" -f ($invoked -join ' '), $SettleSeconds)
+  Start-Sleep -Seconds $SettleSeconds
+} else {
+  Log 'sweep' ('start | ' + ($invoked -join ' '))
 }
 
 $targets = @()
@@ -442,5 +470,14 @@ if ($updated.Count -and $Restart) {
   }
 } elseif ($updated.Count) {
   Write-Host "Updated: $($updated -join ', '). Idle MCP servers pick the new code up on their next start (or run mcp-reload.ps1)."
+}
+
+if ($doWork) {
+  $skipped = @($rows | Where-Object { $_.Action -like 'skipped*' }).Count
+  $note = if ($updated.Count) { ': ' + ($updated -join ', ') } else { '' }
+  Log 'sweep' ('finished | checked {0} | skipped {1} (checked within {2}d) | updated {3}{4}' -f
+        ($rows.Count - $skipped), $skipped, $IntervalDays, $updated.Count, $note)
+} else {
+  Log 'sweep' ('finished (read-only table, {0} servers listed)' -f $rows.Count)
 }
 exit 0

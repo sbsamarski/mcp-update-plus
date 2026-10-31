@@ -1,7 +1,7 @@
 {
   "name": "mcp-update-plus",
-  "version": "1.0.0",
-  "description": "Weekly MCP server update sweep for pi (auto-runs at session start, 90s delayed) plus the /mcp-update-plus command: forced update now, check-only, or named servers. Includes a dataset-freshness check for opennutrition (repo-pinned dataset zip, sha256-verified, DB rebuilt) and a running-server guard (defer or stop-first; pi reconnects on next call).",
+  "version": "1.1.0",
+  "description": "Weekly MCP server update sweep for pi (auto-runs at session start as a hidden background job that settles 90s, survives pi closing, and logs every start/finish) plus the /mcp-update-plus command: forced update now, check-only, or named servers. Sweeps cover every manifest server (-All), so servers disabled in mcp.json stay current too. Includes a dataset-freshness check for opennutrition (repo-pinned dataset zip, sha256-verified, DB rebuilt), a running-server guard (defer or stop-first; pi reconnects on next call), and a one-sweep-at-a-time mutex.",
   "keywords": [
     "pi",
     "pi-extension",

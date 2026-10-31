@@ -5,9 +5,12 @@ update sweep that runs itself in the background, plus a `/mcp-update-plus` comma
 
 ## What it does
 
-- **Weekly sweep** — the `mcp-updater` extension launches `scripts/update-mcp.ps1` in the background
-  90 s after each session starts (detached, never blocks pi). Each server is checked at most once every
-  7 days (state stamps), and only when a newer version actually exists upstream.
+- **Weekly sweep** — the `mcp-updater` extension hands `scripts/update-mcp.ps1` to a hidden background
+  process at every session start (never blocks pi, survives pi closing). The process first waits 90 s so
+  this session's servers finish connecting, then checks each server at most once every 7 days (state
+  stamps) and updates it only when a newer version actually exists upstream. It runs with `-All`, so
+  servers that are installed but currently switched off in `mcp.json` (`enabled: false`) stay current too
+  - otherwise they would silently never be visited.
 - **`/mcp-update-plus`** (in-session command):
   - no args — forced check + update of every manifest server now (ignores stamps), then restarts
     updated servers (pi respawns them on the next tool call)
@@ -53,9 +56,37 @@ extensions/mcp-updater.ts   pi extension: background sweep hook + /mcp-update-pl
 scripts/update-mcp.ps1      the updater itself (kinds, guards, stamps, logging)
 ```
 
+Handy runs for a terminal:
+
+```powershell
+$s = "$HOME\.pi\agent\extensions\mcp-update-plus\scripts\update-mcp.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File $s -CheckOnly -All   # table, changes nothing
+powershell -NoProfile -ExecutionPolicy Bypass -File $s -Force -All       # update everything now
+```
+
 Sweep state lives in `~/.pi/agent/mcp-servers/state/` (`update.log`, `stamps\<name>.stamp`).
 Turn the startup sweep off without uninstalling: create an empty file
 `mcp-servers\state\updates-disabled`.
+
+## Reading the log
+
+Every run writes a `sweep  start` line and a `sweep  finished` line to `update.log`, plus one line per
+thing it actually did, and the extension writes a `launch` line when it hands a sweep to the background.
+So "nothing happened" and "nobody ever got here" are visibly different. If the log has no `start` line
+for a day you had pi open, the hook is not firing - check the extension, not the servers.
+
+Only one sweep runs at a time (a named mutex); a second launcher logs
+`another sweep is already running - this one exits` and leaves.
+
+## Windows pitfall: never spawn PowerShell with `detached: true`
+
+The startup hook must not use Node's `detached: true`. On Windows libuv turns that into the
+`DETACHED_PROCESS` create flag, which gives the child no console at all, and Windows PowerShell 5.1 then
+exits within about 70 ms - having run none of the script, printing nothing, and reporting exit code 0.
+The old hook looked healthy for exactly that reason: a notification claimed the sweep had started, and
+nothing ever reached the log. The hook now starts a short-lived helper PowerShell (which does get a
+console, just no window) that hands the real work to an independent grandchild with `Start-Process`.
+That keeps the fire-and-forget behaviour and it keeps working when pi closes a few seconds later.
 
 > **Note on `tsconfig.json`:** it exists only for optional type-checking on the maintainer's machine
 > (its `paths` entries point at the maintainer's global pi install). It is never used at runtime and
