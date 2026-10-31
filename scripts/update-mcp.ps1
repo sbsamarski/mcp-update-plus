@@ -23,6 +23,7 @@
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Name arxiv,github -Force
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -Restart     # stop the servers it updated, so the new code loads
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -SettleSeconds 90   # wait first (used by the pi startup hook)
+  powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -LockWaitSeconds 600 # how long a manual run waits for a running sweep
   powershell -NoProfile -ExecutionPolicy Bypass -File update-mcp.ps1 -RepairData  # rebuild OpenNutrition 330MB food DB
 .LINK
   a companion reload script (optional) to restart / enable / disable servers in a live session.
@@ -36,7 +37,8 @@ param(
   [switch]$Restart,
   [switch]$RepairData,
   [int]$IntervalDays = 7,
-  [int]$SettleSeconds = 0
+  [int]$SettleSeconds = 0,
+  [int]$LockWaitSeconds = 120
 )
 
 $ErrorActionPreference = 'Continue'
@@ -382,14 +384,6 @@ function Get-ServerPids([string]$name, $cfg) {
 }
 
 # ============================ main =========================================
-# One sweep at a time: two pi sessions started together (or a manual run on top
-# of a background one) would otherwise reinstall the same tool box twice at once.
-$Mutex = New-Object System.Threading.Mutex($false, 'Local\pi-mcp-update-plus')
-if (-not $Mutex.WaitOne(0)) {
-  Log 'sweep' 'another sweep is already running - this one exits'
-  exit 0
-}
-
 if (-not (Test-Path $Manifest)) { Write-Host "missing manifest: $Manifest"; exit 1 }
 if (-not (Test-Path $ConfigF))  { Write-Host "missing config: $ConfigF"; exit 1 }
 $mf = Read-Jsonc $Manifest
@@ -417,6 +411,23 @@ if ($SettleSeconds -gt 0) {
   Start-Sleep -Seconds $SettleSeconds
 } else {
   Log 'sweep' ('start | ' + ($invoked -join ' '))
+}
+
+# One sweep at a time: two pi sessions started together (or a manual run on top
+# of a background one) would otherwise reinstall the same tool box twice at once.
+# The lock is deliberately taken AFTER the settle wait: a background sweep that is
+# only sitting there waiting must not block the command you ran yourself - it did,
+# and the forced run came back "finished OK" having checked nothing. A read-only
+# table needs no lock at all. A run you asked for waits up to 2 min for a sweep
+# that is genuinely working; a background sweep gives up at once instead of queueing.
+if (-not $ReadOnly) {
+  $waitMs = if ($SettleSeconds -gt 0) { 0 } else { $LockWaitSeconds * 1000 }
+  $Mutex = New-Object System.Threading.Mutex($false, 'Local\pi-mcp-update-plus')
+  if (-not $Mutex.WaitOne($waitMs)) {
+    Log 'sweep' 'another sweep is really working - this one exits'
+    Write-Host 'Another MCP update sweep is working right now, so this run changed nothing. Watch mcp-servers\state\update.log, or use -CheckOnly to see versions without waiting.'
+    exit 0
+  }
 }
 
 $targets = @()
@@ -479,5 +490,16 @@ if ($doWork) {
         ($rows.Count - $skipped), $skipped, $IntervalDays, $updated.Count, $note)
 } else {
   Log 'sweep' ('finished (read-only table, {0} servers listed)' -f $rows.Count)
+}
+
+# The last line printed is what the /mcp-update-plus notification shows, so it has
+# to be a real summary. "finished OK" on its own tells you nothing at all.
+if ($doWork) {
+  if ($updated.Count) { Write-Host ('Summary: {0} server(s) updated: {1}.' -f $updated.Count, ($updated -join ', ')) }
+  else { Write-Host ('Summary: {0} server(s) checked, nothing to update.' -f $rows.Count) }
+} else {
+  $ready = @($rows | Where-Object { $_.Action -like 'update available*' })
+  if ($ready.Count) { Write-Host ('Summary: {0} of {1} server(s) have an update waiting: {2}.' -f $ready.Count, $rows.Count, (($ready | ForEach-Object { $_.Server }) -join ', ')) }
+  else { Write-Host ('Summary: all {0} server(s) up to date.' -f $rows.Count) }
 }
 exit 0

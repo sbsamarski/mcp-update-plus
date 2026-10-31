@@ -75,8 +75,20 @@ thing it actually did, and the extension writes a `launch` line when it hands a 
 So "nothing happened" and "nobody ever got here" are visibly different. If the log has no `start` line
 for a day you had pi open, the hook is not firing - check the extension, not the servers.
 
-Only one sweep runs at a time (a named mutex); a second launcher logs
-`another sweep is already running - this one exits` and leaves.
+### Two sweeps at once
+
+Only one sweep may install things at a time (a named mutex), so two pi sessions opened together cannot
+reinstall the same tool box twice. The rules:
+
+- the lock is taken **after** the 90 s settle wait, because a background sweep that is merely waiting
+  must not block a command you ran yourself
+- a read-only table (`check`, `-CheckOnly`, `-Status`) takes no lock and is never blocked
+- a run you asked for waits up to `-LockWaitSeconds` (default 120) for a sweep that is genuinely working;
+  a background sweep gives up immediately instead of queueing
+- when it gives up, it says so on screen and in the log - never a silent "finished OK"
+
+The last line the script prints is a `Summary:` line, and that is what the `/mcp-update-plus`
+notification shows, so a run that changed nothing says "nothing to update" rather than just "OK".
 
 ## Windows pitfall: never spawn PowerShell with `detached: true`
 
